@@ -43,6 +43,7 @@ class Keystore(object):
         self.filename = os.path.join(self.base, name, "%s.kst" % self.name)
         self.csr = os.path.join(self.base, name, "%s.csr" % name)
         self.crt = os.path.join(self.base, name, "%s.crt" % name)
+        self.config = os.path.join(self.base, self.name, "config.json")
         self.password = password
         self.size = size
         self.subject = KeytoolSubject(self.name, subject)
@@ -142,7 +143,7 @@ class Keystore(object):
             raise RuntimeError("import of CA-signed cert failed")
 
     def generate_config(self, host, port, cqlport, keyspace, localdc):
-        with open(os.path.join(self.base, self.name, "config.json"), 'w') as f:
+        with open(self.config, 'w') as f:
             f.write("""{
                 "host":"%s",
                 "port":%d,
@@ -251,7 +252,7 @@ class Authority(object):
         if self.password is None:
             raise RuntimeError("authority is missing mandatory password entry")
 
-        self.base_directory = base_directory
+        self.base_directory = os.path.join(base_directory, "ca")
         self.key = OpensslKey("rootCa", self.base_directory)
         self.certificate = OpensslCertificate("rootCa", self.base_directory, self.key, self.password, cert)
 
@@ -314,6 +315,7 @@ if __name__ == '__main__':
             zf.write(keystore.filename, os.path.basename(keystore.filename))
             zf.write(keystore.crt, os.path.basename(keystore.crt))
             zf.write(keystore.csr, os.path.basename(keystore.csr))
+            zf.write(keystore.config, os.path.basename(keystore.config))
 
     if args.http_service:
         os.chdir(base_directory)
