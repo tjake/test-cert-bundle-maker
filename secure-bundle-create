@@ -7,6 +7,7 @@ import subprocess
 import zipfile
 import http.server
 import socketserver
+import shutil
 
 PORT = 8080
 
@@ -285,18 +286,27 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Manage a certificate authority')
     parser.add_argument('-b', "--base_directory", type=str, default=".",
-                        help="Override base_directory from manifest")
+                        help="base directory for certs")
 
     parser.add_argument('-t', "--tenant", type=str, nargs='+', required=True,
                         help='One or more tenant id to upgrade (defalt will do all)')
 
     parser.add_argument('-s', "--http_service", type=bool, default=False, help="Serve files over http port %d" % PORT)
 
+    parser.add_argument('-e', "--existing_ca_dir", type=str, default=False, help="A directory to copy root ca certs to")
+
+
     args = parser.parse_args()
 
     base_directory = args.base_directory
     if base_directory is None:
         parser.error("base_directory not specified")
+
+    #make dir if not exists 
+    mkdirs(base_directory)
+
+    if args.existing_ca_dir is not None:
+        shutil.copytree(args.existing_ca_dir, os.path.join(base_directory, "ca"))        
 
     authority = Authority(base_directory, "datastax", OpensslSubject("authority.db.astra.datastax.com"))
     authority.generate()
