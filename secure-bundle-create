@@ -42,8 +42,10 @@ class Keystore(object):
         self.name = name
         self.authority = authority
         self.filename = os.path.join(self.base, name, "%s.kst" % self.name)
+        self.p12 = os.path.join(self.base, name, "%s.p12" % self.name)
         self.csr = os.path.join(self.base, name, "%s.csr" % name)
         self.crt = os.path.join(self.base, name, "%s.crt" % name)
+        self.key = os.path.join(self.base, name, "%s.key" % name)
         self.config = os.path.join(self.base, self.name, "config.json")
         self.password = password
         self.size = size
@@ -78,6 +80,34 @@ class Keystore(object):
         if not run_command(command):
             raise RuntimeError("CA key generation failed")
 
+        #Export the key to a PEM format
+        command = [
+            "keytool", 
+            "-importkeystore",
+            "-srckeystore", self.filename,
+            "-destkeystore", self.p12,
+            "-deststoretype", "PKCS12",
+            "-srcalias", self.name,
+            "-srcstorepass", self.password,
+            "-deststorepass", self.password,
+            "-destkeypass", self.password
+        ]
+        if not run_command(command):
+            raise RuntimeError("PKCS12 export failed")
+
+        command = [
+            "openssl", 
+            "pkcs12", 
+            "-in", self.p12,
+            "-passin", "pass:%s" % self.password, 
+            "-nodes",
+            "-nocerts", 
+            "-out", self.key
+        ]
+
+        if not run_command(command):
+            raise RuntimeError("KEY export failed")
+
         # Generate a certificate signing request.
         command = [
             "keytool",
@@ -102,8 +132,9 @@ class Keystore(object):
             "-CA",    self.authority.certificate.filename,
             "-CAkey", self.authority.key.filename,
             "-days",  str(self.valid),
-            "-out",   self.crt
+            "-out",   self.crt,
         ]
+
         if not run_command(command):
             raise RuntimeError("certificate signing failed")
 
@@ -158,8 +189,7 @@ class Keystore(object):
                 "keyStorePassword":"%s",
                 "trustStoreLocation":"./%s",
                 "trustStorePassword":"%s"
-}""" % (host, port, cqlport, keyspace, localdc, os.path.basename(self.authority.certificate.filename), os.path.basename(self.authority.key.filename), 
-        os.path.basename(self.crt), os.path.basename(self.filename), self.password, os.path.basename(self.authority.certificate.truststore), self.authority.password)) 
+}""" % (host, port, cqlport, keyspace, localdc, "ca.crt", "key", "cert", os.path.basename(self.filename), self.password, os.path.basename(self.authority.certificate.truststore), self.authority.password)) 
  
     def __repr__(self):
         return "%s(name=%s, filename=%s, size=%s, subject=%s)" \
@@ -171,14 +201,15 @@ class OpensslSubject(Subject):
         return "/CN=%s/OU=%s/O=%s/C=%s/" % (self.common_name, self.unit, self.organization, self.country)
 
 class OpensslCertificate(object):
-    def __init__(self, name, path, key, password, subject, valid = 365):
+    def __init__(self, name, path, key, password, subject, valid = 365, common_name = None):
         self.name = name
+        self.common_name = common_name or name
         self.base = os.path.abspath(path)
         self.filename = os.path.join(self.base, "%s.crt" % self.name)
         self.truststore = os.path.join(self.base, "truststore")
         self.key = key
         self.password = password
-        self.subject = OpensslSubject(name, subject)
+        self.subject = OpensslSubject(common_name, subject)
         self.valid = valid
 
     def generate(self):
@@ -255,7 +286,7 @@ class Authority(object):
 
         self.base_directory = os.path.join(base_directory, "ca")
         self.key = OpensslKey("rootCa", self.base_directory)
-        self.certificate = OpensslCertificate("rootCa", self.base_directory, self.key, self.password, cert)
+        self.certificate = OpensslCertificate("rootCa", self.base_directory, self.key, self.password, cert, common_name="localhost")
 
     def generate(self):
         self.key.generate()
@@ -280,7 +311,6 @@ def mkdirs(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-
 if __name__ == '__main__':
     import argparse
 
@@ -293,7 +323,7 @@ if __name__ == '__main__':
 
     parser.add_argument('-s', "--http_service", type=bool, default=False, help="Serve files over http port %d" % PORT)
 
-    parser.add_argument('-e', "--existing_ca_dir", type=str, default=False, help="A directory to copy root ca certs to")
+    parser.add_argument('-e', "--existing_ca_dir", type=str, default=None, help="A directory to copy root ca certs to")
 
 
     args = parser.parse_args()
@@ -308,22 +338,37 @@ if __name__ == '__main__':
     if args.existing_ca_dir is not None:
         shutil.copytree(args.existing_ca_dir, os.path.join(base_directory, "ca"))        
 
-    authority = Authority(base_directory, "datastax", OpensslSubject("authority.db.astra.datastax.com"))
+    authority = Authority(base_directory, "datastax", OpensslSubject("*.ingress.svc.cluster.local"))
     authority.generate()
 
     for tenant_id in args.tenant:
-        keystore = Keystore(base_directory, authority, tenant_id, "datastax", OpensslSubject("client.%s-db1.db.astra.datastax.com" % tenant_id))
+        keystore = Keystore(base_directory, authority, "client.%s.db.astra.datastax.com" % tenant_id, "datastax", OpensslSubject("client.%s.db.astra.datastax.com" % tenant_id))
         keystore.generate()
-        keystore.generate_config("client.%s-db1.db.astra.datastax.com" % tenant_id, 29080, 29042, "db1", "dc1")
+        keystore.generate_config("nginx.ingress.svc.cluster.local", 29080, 29042, "db1", "dc1")
         with zipfile.ZipFile(os.path.join(base_directory, "secure-bundle-%s.zip" % tenant_id), mode='w') as zf:
             print("adding cafile")
-            zf.write(authority.key.filename, os.path.basename(authority.key.filename))
-            zf.write(authority.certificate.filename, os.path.basename(authority.certificate.filename))
+            zf.write(authority.key.filename, "ca.key")
+            zf.write(authority.certificate.filename, "ca.crt")
             zf.write(authority.certificate.truststore, os.path.basename(authority.certificate.truststore))
 
             print("adding tenant certs")
             zf.write(keystore.filename, os.path.basename(keystore.filename))
-            zf.write(keystore.crt, os.path.basename(keystore.crt))
+            zf.write(keystore.crt,  "cert")
+            zf.write(keystore.key,  "key")
+            zf.write(keystore.csr, os.path.basename(keystore.csr))
+            zf.write(keystore.config, os.path.basename(keystore.config))
+
+        keystore.generate_config("localhost", 29080, 29042, "db1", "dc1")
+        with zipfile.ZipFile(os.path.join(base_directory, "proxy-secure-bundle-%s.zip" % tenant_id), mode='w') as zf:
+            print("adding cafile")
+            zf.write(authority.key.filename, "ca.key")
+            zf.write(authority.certificate.filename, "ca.crt")
+            zf.write(authority.certificate.truststore, os.path.basename(authority.certificate.truststore))
+
+            print("adding tenant certs")
+            zf.write(keystore.filename, os.path.basename(keystore.filename))
+            zf.write(keystore.crt,  "cert")
+            zf.write(keystore.key,  "key")
             zf.write(keystore.csr, os.path.basename(keystore.csr))
             zf.write(keystore.config, os.path.basename(keystore.config))
 
