@@ -41,7 +41,10 @@ class Keystore(object):
         self.base = os.path.abspath(path)
         self.name = name
         self.authority = authority
-        self.filename = os.path.join(self.base, name, "%s.kst" % self.name)
+
+        self.keystore = os.path.join(self.base, name, "identity.jks")
+        self.truststore = os.path.join(self.base, name, "trustStore.jks")
+
         self.p12 = os.path.join(self.base, name, "%s.p12" % self.name)
         self.csr = os.path.join(self.base, name, "%s.csr" % name)
         self.crt = os.path.join(self.base, name, "%s.crt" % name)
@@ -55,8 +58,8 @@ class Keystore(object):
         mkdirs(os.path.join(self.base, name))
 
     def generate(self):
-        if os.path.exists(self.filename):
-            logging.warn("%s already exists, skipping keystore generation...", self.filename)
+        if os.path.exists(self.truststore):
+            logging.warning("%s already exists, skipping keystore generation...", self.truststore)
             return
 
         # Generate the node key
@@ -70,12 +73,13 @@ class Keystore(object):
             "keytool",
             "-genkeypair",
             "-dname",     str(self.subject),
+            "-storetype", "PKCS12",
             "-keyalg",    "RSA",
             "-alias",     self.name,
             "-validity",  str(self.valid),
             "-storepass", self.password,
             "-keypass",   self.password,
-            "-keystore",  self.filename
+            "-keystore",  self.keystore
         ]
         if not run_command(command):
             raise RuntimeError("CA key generation failed")
@@ -84,13 +88,13 @@ class Keystore(object):
         command = [
             "keytool", 
             "-importkeystore",
-            "-srckeystore", self.filename,
+            "-srckeystore", self.keystore,
             "-destkeystore", self.p12,
             "-deststoretype", "PKCS12",
             "-srcalias", self.name,
             "-srcstorepass", self.password,
             "-deststorepass", self.password,
-            "-destkeypass", self.password
+            "-destkeypass", self.password,
         ]
         if not run_command(command):
             raise RuntimeError("PKCS12 export failed")
@@ -114,10 +118,10 @@ class Keystore(object):
             "-certreq",
             "-dname",     str(self.subject),
             "-alias",     self.name,
+            "-keystore",  self.keystore,
             "-file",      self.csr,
             "-keypass",   self.password,
-            "-storepass", self.password,
-            "-keystore",  self.filename
+            "-storepass", self.password
         ]
         if not run_command(command):
             raise RuntimeError("signing request generation failed")
@@ -133,6 +137,7 @@ class Keystore(object):
             "-CAkey", self.authority.key.filename,
             "-days",  str(self.valid),
             "-out",   self.crt,
+            "-sha256"
         ]
 
         if not run_command(command):
@@ -153,10 +158,12 @@ class Keystore(object):
         command = [
             "keytool",
             "-importcert",
+            "-storetype", "PKCS12",
             "-noprompt",
+            "-trustcacerts",
             "-file",      self.authority.certificate.filename,
             "-storepass", self.password,
-            "-keystore",  self.filename
+            "-keystore",  self.keystore
         ]
         if not run_command(command):
             raise RuntimeError("import of CA cert failed")
@@ -166,10 +173,12 @@ class Keystore(object):
             "keytool",
             "-importcert",
             "-noprompt",
+            "-storetype", "PKCS12",
+            "-trustcacerts",
             "-file",      self.crt,
             "-alias",     self.name,
             "-storepass", self.password,
-            "-keystore",  self.filename
+            "-keystore",  self.keystore
         ]
         if not run_command(command):
             raise RuntimeError("import of CA-signed cert failed")
@@ -189,11 +198,11 @@ class Keystore(object):
                 "keyStorePassword":"%s",
                 "trustStoreLocation":"./%s",
                 "trustStorePassword":"%s"
-}""" % (host, port, cqlport, keyspace, localdc, "ca.crt", "key", "cert", os.path.basename(self.filename), self.password, os.path.basename(self.authority.certificate.truststore), self.authority.password)) 
+}""" % (host, port, cqlport, keyspace, localdc, "ca.crt", "key", "cert", os.path.basename(self.keystore), self.password, os.path.basename(self.truststore), self.password)) 
  
     def __repr__(self):
         return "%s(name=%s, filename=%s, size=%s, subject=%s)" \
-            % (self.__class__.__name__, self.name, self.filename, self.size, self.subject)
+            % (self.__class__.__name__, self.name, self.keystore, self.size, self.subject)
 
 
 class OpensslSubject(Subject):
@@ -207,14 +216,17 @@ class OpensslCertificate(object):
         self.base = os.path.abspath(path)
         self.filename = os.path.join(self.base, "%s.crt" % self.name)
         self.truststore = os.path.join(self.base, "truststore")
+        self.config = os.path.join(self.base, "config.cf")
         self.key = key
         self.password = password
         self.subject = OpensslSubject(common_name, subject)
         self.valid = valid
 
+        self.gen_config()
+
     def generate(self):
         if os.path.exists(self.filename):
-            logging.warn("%s already exists, skipping certificate generation...", self.filename)
+            logging.warning("%s already exists, skipping certificate generation...", self.filename)
             return
 
         # Generate the CA certificate
@@ -227,6 +239,8 @@ class OpensslCertificate(object):
             "-subj", str(self.subject),
             "-days", str(self.valid),
             "-key", self.key.filename,
+            "-reqexts", "cndb_root",
+            "-config", self.config,
             "-out", self.filename
         ]
         if not run_command(command):
@@ -251,6 +265,17 @@ class OpensslCertificate(object):
         ]
         if not run_command(command):
             raise RuntimeError("CA truststore generation failed")
+
+    def gen_config(self):
+        configs = ["/usr/local/ssl/openssl.cnf","/usr/lib/ssl/openssl.cnf","/etc/ssl/openssl.cnf"]
+        for c in configs:
+            if os.path.exists(c):
+                with open(self.config, 'w') as f, open(c, 'r') as cf:
+                    for line in cf:
+                        f.write(line)
+                    f.write("[cndb_root]")
+                    f.write("keyUsage = critical,digitalSignature,keyEncipherment")
+                    f.write("extendedKeyUsage = serverAuth,clientAuth")
 
     def __repr__(self):
         return "%s(name=%s, filename=%s, subject=%s, valid=%d)" \
@@ -286,7 +311,7 @@ class Authority(object):
 
         self.base_directory = os.path.join(base_directory, "ca")
         self.key = OpensslKey("rootCa", self.base_directory)
-        self.certificate = OpensslCertificate("rootCa", self.base_directory, self.key, self.password, cert, common_name="localhost")
+        self.certificate = OpensslCertificate("rootCa", self.base_directory, self.key, self.password, cert)
 
     def generate(self):
         self.key.generate()
@@ -352,21 +377,8 @@ if __name__ == '__main__':
             zf.write(authority.certificate.truststore, os.path.basename(authority.certificate.truststore))
 
             print("adding tenant certs")
-            zf.write(keystore.filename, os.path.basename(keystore.filename))
-            zf.write(keystore.crt,  "cert")
-            zf.write(keystore.key,  "key")
-            zf.write(keystore.csr, os.path.basename(keystore.csr))
-            zf.write(keystore.config, os.path.basename(keystore.config))
-
-        keystore.generate_config("localhost", 29080, 29042, "db1", "dc1")
-        with zipfile.ZipFile(os.path.join(base_directory, "proxy-secure-bundle-%s.zip" % tenant_id), mode='w') as zf:
-            print("adding cafile")
-            zf.write(authority.key.filename, "ca.key")
-            zf.write(authority.certificate.filename, "ca.crt")
-            zf.write(authority.certificate.truststore, os.path.basename(authority.certificate.truststore))
-
-            print("adding tenant certs")
-            zf.write(keystore.filename, os.path.basename(keystore.filename))
+            zf.write(keystore.keystore, os.path.basename(keystore.keystore))
+            zf.write(keystore.keystore, os.path.basename(keystore.truststore))
             zf.write(keystore.crt,  "cert")
             zf.write(keystore.key,  "key")
             zf.write(keystore.csr, os.path.basename(keystore.csr))
